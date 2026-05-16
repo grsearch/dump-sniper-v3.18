@@ -1,0 +1,41 @@
+{
+  "name": "dump-sniper",
+  "version": "3.18.0-week2",
+  "description": "Solana Pump.fun dump-rebound sniper. v3.18 Week 2: ShredStream gRPC source + bincode entry decoder. Bundle path ready, awaiting Week 3 DumpDetector integration.",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --trace-warnings src/index.js",
+    "health": "node scripts/health.js",
+    "health:json": "node scripts/health.js --json",
+    "fill-pools": "node scripts/fill-pools.js",
+    "latency": "node scripts/latency-analyze.js",
+    "dissect": "node scripts/latency-dissect.js",
+    "strategy": "node scripts/strategy-analyze.js",
+    "stuck": "node scripts/stuck.js",
+    "analyze": "node scripts/analyze.js",
+    "ss-stats": "node scripts/ss-lead-stats.js"
+  },
+  "dependencies": {
+    "@allenhark/slipstream": "^0.3.5",
+    "@coral-xyz/anchor": "^0.30.1",
+    "@grpc/grpc-js": "^1.14.3",
+    "@grpc/proto-loader": "^0.8.1",
+    "@pump-fun/pump-swap-sdk": "^1.14.0",
+    "@solana/spl-token": "^0.4.8",
+    "@solana/web3.js": "^1.95.3",
+    "@triton-one/yellowstone-grpc": "^5.0.8",
+    "axios": "^1.7.7",
+    "better-sqlite3": "^11.3.0",
+    "bn.js": "^5.2.1",
+    "bs58": "^6.0.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "node-cron": "^3.0.3",
+    "shredstream": "^2.0.0",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
