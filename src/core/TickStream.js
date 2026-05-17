@@ -143,7 +143,7 @@ class RegionStream {
   }
 
   async _closeStream() {
-    console.log('[TickStream:undefined] _closeStream called, stream=false, client=false');
+    console.log(`[TickStream:${this.label}] _closeStream called, stream=${!!this.stream}, client=${!!this.client}`);
     if (this.stream) {
       try { this.stream.end(); } catch (_) { /* ignore */ }
       this.stream = null;
@@ -327,6 +327,19 @@ class TickStream extends EventEmitter {
     };
     this._ssLeadStatsTimer = null;
 
+    // v3.18: rawTx cache — SS 收到的 raw bytes 按 signature 缓存
+    // LS 路径产出的 dumpSignal 可以查这个缓存拿到 dumpTxRaw
+    this._rawTxCache = new Map(); // sig → { rawTx, expireAt }
+    this._rawTxCacheMax = 2000;
+    this._rawTxCleanupInterval = setInterval(() => this._cleanRawTxCache(), 60_000);
+    if (this._rawTxCleanupInterval.unref) this._rawTxCleanupInterval.unref();
+
+    // v3.18 Week 3: SsSwapDetector — SS 路径专属砸盘检测器
+    // 不等 LS confirm,直接从 raw tx 解析 Pump AMM sell instruction
+    // 这是 atomic Jito Bundle 的关键 (LS 路径必然 +1 slot,SS 路径才能同 slot)
+    // 由 main 通过 setSsSwapDetector() 注入,可选
+    this._ssSwapDetector = null;
+
     // ---- Helius LaserStream regions ----
     const laserEndpoints = config.helius.laserstreamEndpoints || [];
     if (laserEndpoints.length === 0) {
@@ -480,6 +493,13 @@ class TickStream extends EventEmitter {
           this._recordRegionPair(firstInfo.region, region, leadMs);
           this._sigFirstRegion.delete(sig);
         }
+      }
+      // v3.18.1: SS 先到时 DumpDetector 无法解析 (parsedNull)，
+      // LS 后到虽被 dedup 但仍需给 DumpDetector 第二次机会解析。
+      // 只对 LS→DumpDetector 透传，不影响统计计数。
+      if (sig && !region.startsWith('SS') && !region.startsWith('AH')) {
+        this.emit('transaction', txMessage, { firstRegion: region, dedupRetry: true });
+        monitor.inc('TickStream.dedupRetryEmit', 1, 'TickStream');
       }
       return;
     }
@@ -674,7 +694,7 @@ class TickStream extends EventEmitter {
 
           if (!isFirst) {
             monitor.inc('TickStream.SS.dedup_dup', 1, 'TickStream');
-            // v3.17.13: SS 后到,前面有别的 region 先到了。算 lead time
+            // v3.17.13: SS 後到,前面有別的 region 先到了。算 lead time
             if (sig) {
               const firstInfo = this._sigFirstRegion.get(sig);
               if (firstInfo) {
@@ -682,6 +702,8 @@ class TickStream extends EventEmitter {
                 this._recordRegionPair(firstInfo.region, 'SS', leadMs);
                 this._sigFirstRegion.delete(sig);
               }
+              // v3.18.1: SS 被 dedup 後仍缓存 rawTx，供 LS 産出的 dumpSignal 查找
+              this._cacheRawTx(sig, buf);
             }
             continue;
           }
@@ -689,6 +711,26 @@ class TickStream extends EventEmitter {
           ssMatch++;
           monitor.inc('TickStream.SS.dedup_first', 1, 'TickStream');
           this._ssLeadCounters.ssFirstCount++;
+
+          // v3.18 Week 3: 立即把 raw tx 喂给 SsSwapDetector (如果注入了)
+          // detector 内部判断是否砸盘,如果是 → 立即 emit dumpSignal (含 dumpTxRaw)
+          // 这是 atomic Jito Bundle 模式的关键路径 - 跳过等 LS confirm 的延迟
+          //
+          // 如果 detector 判定砸盘:
+          //   - dumpSignal → SignalEngine → Executor.buyBundle
+          //   - LS 路径也会收到这个 tx, 但 SsSwapDetector 的 dedup 会拦截
+          //
+          // 如果 detector 判定不是砸盘(buy/小卖单/非监控池):
+          //   - 不 emit, 仍走 LS 兜底路径
+          if (this._ssSwapDetector) {
+            try {
+              // 注意: detector 同步处理(byte scan + parse + 决策 ~3ms)
+              // 不能 await, 否则会阻塞后续 tx
+              this._ssSwapDetector.handleRawTx(buf, slot);
+            } catch (err) {
+              monitor.recordError('TickStream', err, { phase: 'ss_swap_detect' });
+            }
+          }
 
           // 构造和 LaserStream 兼容的 txMessage
           const signatureBuffers = tx.signatures.map((s) => Buffer.from(s));
@@ -711,13 +753,19 @@ class TickStream extends EventEmitter {
               err: null,
               logMessages: null,
             },
+            // v3.18: 保留 raw bytes 用于 Jito Bundle (buyBundle 需要)
+            dumpTxRaw: buf,
           };
 
           monitor.inc('TickStream.txReceived', 1, 'TickStream');
           monitor.beat('TickStream', 'tx_first:SS');
           monitor.set('TickStream.dedupSize', this.dedup.size(), 'TickStream');
           monitor.set('TickStream.latestSlot', this._latestSlot, 'TickStream');
-          if (sig) this._sigFirstRegion.set(sig, { region: 'SS', ts: Date.now() });
+          if (sig) {
+            this._sigFirstRegion.set(sig, { region: 'SS', ts: Date.now() });
+            // v3.18: 缓存 rawTx bytes，供 LS 路径产出的 dumpSignal 查找
+            this._cacheRawTx(sig, buf);
+          }
           this.emit('transaction', txMessage, { firstRegion: 'SS' });
         } catch (_) {
           // deserialize 失败（shred 可能不完整），跳过
@@ -734,6 +782,53 @@ class TickStream extends EventEmitter {
   get latestSlot() {
     return this._latestSlot;
   }
+
+  /**
+   * v3.18 Week 3: 注入 SsSwapDetector
+   * 注入后,每条 SS 路径收到的 Pump AMM raw tx 都会先喂给 detector,
+   * 让 detector 直接判断是否砸盘并 emit dumpSignal (不等 LS confirm)
+   */
+  setSsSwapDetector(detector) {
+    this._ssSwapDetector = detector;
+    if (detector) {
+      console.log('[TickStream] SsSwapDetector attached — SS path will emit dumpSignals directly');
+    }
+  }
+
+  // v3.18: 缓存 SS 收到的 rawTx bytes，供 LS 路径的 dumpSignal 查找
+  _cacheRawTx(sig, rawTx) {
+    if (!sig) return;
+    this._rawTxCache.set(sig, { rawTx, expireAt: Date.now() + DEDUP_TTL_MS });
+    if (this._rawTxCache.size > this._rawTxCacheMax) this._cleanRawTxCache();
+  }
+
+  /** 查找缓存的 rawTx bytes（供 DumpDetector 使用） */
+  getRawTx(sig) {
+    if (!sig) return null;
+    const entry = this._rawTxCache.get(sig);
+    if (entry && entry.expireAt > Date.now()) return entry.rawTx;
+    if (entry) this._rawTxCache.delete(sig);
+    return null;
+  }
+
+  _cleanRawTxCache() {
+    const now = Date.now();
+    for (const [sig, entry] of this._rawTxCache) {
+      if (entry.expireAt <= now) this._rawTxCache.delete(sig);
+    }
+    // 容量裁剪
+    if (this._rawTxCache.size > this._rawTxCacheMax) {
+      const toDelete = this._rawTxCache.size - Math.floor(this._rawTxCacheMax * 0.9);
+      let i = 0;
+      for (const key of this._rawTxCache.keys()) {
+        if (i++ >= toDelete) break;
+        this._rawTxCache.delete(key);
+      }
+    }
+  }
 }
 
 module.exports = TickStream;
+
+// Debug: count dedup retries
+TickStream.prototype._dedupRetryCount = 0;

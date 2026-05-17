@@ -51,13 +51,48 @@ class DumpDetector extends EventEmitter {
     super();
     this.tokenRegistry = tokenRegistry;
     this.poolStateCache = null;
+    // v3.18.1: RPC 连接，用于在 rawTx 缺失时从链上拉取
+    this._rpcConnection = null;
+    // v3.18.1: 记录已成功解析的 sig，防止 LS dedup 重试时重复处理
+    this._parsedSigs = new Map(); // sig → expireAt
+    this._parsedSigsMax = 2000;
   }
 
   setPoolStateCache(cache) {
     this.poolStateCache = cache;
   }
 
-  handleTransaction(txMessage) {
+  setRpcConnection(conn) {
+    this._rpcConnection = conn;
+  }
+
+  /**
+   * v3.18 Week 3: 注入 SsSwapDetector
+   * 让 DumpDetector 在 LS 路径处理 tx 前检查 sig 是否已由 SsSwapDetector 触发过
+   * 防止 SS 和 LS 双触发同一砸盘
+   */
+  setSsSwapDetector(detector) {
+    this._ssSwapDetector = detector;
+  }
+
+  async handleTransaction(txMessage, meta) {
+    // v3.18.1: dedupRetry = LS 被 dedup 后的第二次机会
+    // 如果这个 sig 之前已经成功解析过(非 parsedNull),跳过
+    const isRetry = meta?.dedupRetry;
+    const sig = this._extractSignature(txMessage?.transaction);
+    if (isRetry && sig) {
+      if (this._parsedSigs.has(sig)) {
+        return; // 已经成功解析过,不需要重试
+      }
+    }
+
+    // v3.18 Week 3: SS 路径已经判定 + 触发过的 sig, LS 路径跳过
+    // 避免 SS 已触发 bundle BUY 后, LS 又触发普通 BUY 造成双买
+    if (sig && this._ssSwapDetector && this._ssSwapDetector.hasProcessed(sig)) {
+      monitor.inc('DumpDetector.skipped_ss_already_processed', 1, 'DumpDetector');
+      return;
+    }
+
     monitor.inc('DumpDetector.txParsed', 1, 'DumpDetector');
     monitor.beat('DumpDetector', 'parse');
     try {
@@ -65,6 +100,24 @@ class DumpDetector extends EventEmitter {
       if (!parsed) {
         monitor.inc('DumpDetector.parsedNull', 1, 'DumpDetector');
         return;
+      }
+
+
+      // v3.18.1: 记录成功解析的 sig，防止 LS 重试时重复处理
+      if (parsed.signature) {
+        this._parsedSigs.set(parsed.signature, Date.now() + 5 * 60_000);
+        if (this._parsedSigs.size > this._parsedSigsMax) {
+          const now = Date.now();
+          for (const [k, v] of this._parsedSigs) {
+            if (v <= now) this._parsedSigs.delete(k);
+          }
+          if (this._parsedSigs.size > this._parsedSigsMax) {
+            const keys = [...this._parsedSigs.keys()];
+            for (let i = 0; i < Math.floor(this._parsedSigsMax * 0.1); i++) {
+              this._parsedSigs.delete(keys[i]);
+            }
+          }
+        }
       }
 
       // emit priceTick (DumpDetector 只 emit "可信"价格——pool 已知的)
@@ -136,6 +189,50 @@ class DumpDetector extends EventEmitter {
           `sellSol=${sellSol.toFixed(2)} impact=${priceImpactPct.toFixed(1)}% ` +
           `source=${regionLabel} slot=${parsed.slot} sig=${parsed.signature?.slice(0,12)}.. sigMapSize=${sigMapSize}${debugInfo}`,
         );
+
+        // v3.18.1: micro-retry rawTx — 当 LS 先到检测到砸盘但 rawTx 缺失时，
+        // 等待 SS 到来缓存 rawTx（SS 通常比 LS 慢 5-50ms）
+        // 这样 dumpSignal 就能携带 dumpTxRaw，使 Bundle 模式可用
+        let rawTx = txMessage.dumpTxRaw || null;
+        if (!rawTx && this._tickStream && parsed.signature) {
+          rawTx = this._tickStream.getRawTx(parsed.signature); // one-time read
+          if (!rawTx) {
+            // SS 还没到，微重试：3 次 × 15ms = 最多 45ms 额外延迟
+            for (let i = 0; i < 3; i++) {
+              await new Promise(r => setTimeout(r, 15));
+              rawTx = this._tickStream.getRawTx(parsed.signature);
+              if (rawTx) {
+                console.log(`[DumpDetector] rawTx micro-retry hit: attempt ${i + 1}, ${rawTx.length} bytes`);
+                break;
+              }
+            }
+          }
+        }
+        if (!rawTx && parsed.signature) {
+          console.log(`[DumpDetector] rawTx still missing after micro-retry for ${parsed.symbol || parsed.baseMint?.slice(0,6)}`);
+          // v3.18.1: RPC fallback — SS 没缓存到 rawTx，从链上拉
+          // 这是 Bundle 模式的最后手段：~50-100ms 延迟，但比放弃 Bundle 强
+          // 注意：如果砸盘 tx 已落链，Jito bundle 可能被拒绝（dump tx 已 finalized）
+          // 但如果还在当前 slot 内，Jito 仍可能打包
+          if (this._rpcConnection) {
+            try {
+              const rpcStart = Date.now();
+              const txResult = await this._rpcConnection.getTransaction(parsed.signature, {
+                encoding: 'base64',
+                maxSupportedTransactionVersion: 0,
+              });
+              if (txResult?.transaction?.[0]) {
+                rawTx = Buffer.from(txResult.transaction[0], 'base64');
+                console.log(`[DumpDetector] rawTx RPC fallback: ${rawTx.length} bytes, ${Date.now() - rpcStart}ms`);
+              } else {
+                console.log(`[DumpDetector] rawTx RPC fallback: tx not found (${Date.now() - rpcStart}ms)`);
+              }
+            } catch (err) {
+              console.warn(`[DumpDetector] rawTx RPC fallback failed: ${err.message}`);
+            }
+          }
+        }
+
         this.emit('dumpSignal', {
           mint: parsed.baseMint,
           symbol: parsed.symbol,
@@ -145,7 +242,7 @@ class DumpDetector extends EventEmitter {
           seller: parsed.signer,
           signature: parsed.signature,
           ts: parsed.ts,
-          slot: parsed.slot, // v3.17.7: 砸盘交易的链上 slot
+          slot: parsed.slot,
           poolAddress: parsed.poolAddress,
           poolBaseVault: parsed.poolBaseVault,
           poolQuoteVault: parsed.poolQuoteVault,
@@ -153,6 +250,7 @@ class DumpDetector extends EventEmitter {
           priceBefore: parsed.priceBefore,
           baseDecimals: parsed.baseDecimals,
           quoteDecimals: parsed.quoteDecimals,
+          dumpTxRaw: rawTx,
         });
       }
     } catch (err) {
@@ -213,7 +311,9 @@ class DumpDetector extends EventEmitter {
         }
       }
     }
-    if (!baseMint) return null;
+    if (!baseMint) {
+      return null;
+    }
 
     const tokenInfo = this.tokenRegistry.getToken(baseMint);
     if (!tokenInfo) {

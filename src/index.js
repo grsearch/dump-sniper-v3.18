@@ -84,6 +84,7 @@ async function main() {
     });
     executor.setPoolStateCache(poolStateCache);
     dumpDetector.setPoolStateCache(poolStateCache);
+    dumpDetector.setRpcConnection(executor.rpc);
     poolStateCache.start();
   }
 
@@ -101,60 +102,45 @@ async function main() {
   dumpDetector._tickStream = tickStream;
   const signalEngine = new SignalEngine({ tradeLogger, positionManager, tickStream });
 
-  // ============ v3.18 Week 2: ShredStream.com SDK 订阅 ============
-  // 独立运行,提供砸盘 tx 的 raw wire bytes 给 Executor.buyBundle() 用
-  // Week 3 会接入 DumpDetector, 这里只先把数据流接通
+  // ============ v3.18 Week 3: SsSwapDetector — SS 路径砸盘检测 ============
+  // 解决根本问题: LS 路径必然 +1 slot 落链 (LS 推送 dump tx 时 dump 已经 confirmed,
+  //              Jito Bundle 收到时 dump tx 已被 leader 打包, 返回 400)
   //
-  // ShredStream.com 跟 Jito 官方 ShredStream 不同:
-  //   - 不需要本地 docker proxy
-  //   - shredstream npm SDK 直接 UDP 接收 + 自动 deshred + 输出 wire-format tx
-  //   - 你在 dashboard 配置目标 IP:port, 他们推 UDP shreds 给你
+  // SsSwapDetector 不等 LS confirm,直接从 SS raw tx 解析 Pump AMM sell instruction:
+  //   1. byte scan (Pump AMM program in raw)
+  //   2. VersionedTransaction.deserialize
+  //   3. 找 sell discriminator (8 bytes)
+  //   4. 解 base_amount_in (u64 LE)
+  //   5. 从 PoolStateCache 当前 reserves 算 SOL 价值 + priceImpact
+  //   6. 通过阈值 → emit dumpSignal (含 dumpTxRaw)
   //
-  // 启用条件:
-  //   - SHREDSTREAM_ENABLED=true
-  //   - SHREDSTREAM_PORT 配置 (跟 ShredStream.com dashboard 一致)
-  //   - npm install shredstream (Rust napi-rs 模块, 部署服务器才能装上)
-  //   - 服务器 sysctl: net.core.rmem_max=67108864, net.core.busy_read=200
-  //   - 防火墙 allow 入站 UDP
-  let shredStreamSource = null;
-  if ((process.env.SHREDSTREAM_ENABLED || '').toLowerCase() === 'true') {
-    try {
-      const ShredStreamSource = require('./data/ShredStreamSource');
-      const port = parseInt(process.env.SHREDSTREAM_PORT || '8001', 10);
-      const PUMP_AMM_PROGRAM = process.env.PUMP_AMM_PROGRAM_ID || 'pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA';
-
-      shredStreamSource = new ShredStreamSource({
-        port,
-        includePrograms: [PUMP_AMM_PROGRAM],
-        recvBufBytes: parseInt(process.env.SHREDSTREAM_RECV_BUF_BYTES || '67108864', 10),
-        busyPollUs: parseInt(process.env.SHREDSTREAM_BUSY_POLL_US || '200', 10),
-      });
-
-      let recentTxCount = 0;
-      let recentTxLastReport = Date.now();
-      shredStreamSource.on('transaction', (tx) => {
-        recentTxCount++;
-        // 每分钟报告一次(确认接入工作)
-        const now = Date.now();
-        if (now - recentTxLastReport > 60_000) {
-          console.log(
-            `[main] ShredStream: ${recentTxCount} Pump AMM tx received in last 60s ` +
-              `(latest slot=${tx.slot})`,
-          );
-          recentTxCount = 0;
-          recentTxLastReport = now;
-        }
-      });
-
-      await shredStreamSource.start();
-      console.log(
-        `[main] ShredStream enabled, UDP port=${port}, program filter=${PUMP_AMM_PROGRAM.slice(0, 6)}..`,
-      );
-    } catch (err) {
-      console.error(`[main] ShredStream setup failed: ${err.message}`);
-      // 不致命 — 主路径继续工作
-    }
+  // 这是 atomic Jito Bundle 同 slot 落链的唯一路径
+  let ssSwapDetector = null;
+  if (process.env.SS_SWAP_DETECTOR_ENABLED?.toLowerCase() === 'true') {
+    const SsSwapDetector = require('./core/SsSwapDetector');
+    ssSwapDetector = new SsSwapDetector({
+      tokenRegistry,
+      poolStateCache: executor.poolStateCache, // 已经初始化好
+    });
+    // 把 dumpSignal 接到 signalEngine,跟 LS 路径一样处理
+    ssSwapDetector.on('dumpSignal', (signal) => {
+      // 同样的逻辑: 刷新 pool state, 转给 signalEngine
+      if (executor.poolStateCache && signal.poolAddress) {
+        executor.poolStateCache.refreshOne(signal.poolAddress).catch(() => {});
+      }
+      signalEngine.handleDumpSignal(signal);
+    });
+    // 互相通知: TickStream SS 路径喂 detector / DumpDetector 检查 detector 是否已处理
+    tickStream.setSsSwapDetector(ssSwapDetector);
+    dumpDetector.setSsSwapDetector(ssSwapDetector);
+    console.log('[main] v3.18 Week 3 SsSwapDetector ENABLED — SS path will trigger Bundle BUY directly');
   }
+
+  // ============ v3.18 ShredStream.com ============
+  // ShredStream 已集成到 TickStream 内部 (_shredLoop),
+  // 不再需要独立的 ShredStreamSource (会导致双 bind 同一 UDP 端口,
+  // 内核 SO_REUSEPORT 将包分给旧 socket, TickStream 的 _shredLoop 收不到数据)。
+  // TickStream._startShredStream() 在 start() 时自动启动。
 
   // ============ 报告 ============
   const dailyReport = new DailyReport({ tradeLogger, tokenRegistry });
@@ -208,7 +194,7 @@ async function main() {
 
   // ============ 事件连线 ============
 
-  tickStream.on('transaction', (tx) => dumpDetector.handleTransaction(tx));
+  tickStream.on('transaction', (tx, meta) => dumpDetector.handleTransaction(tx, meta));
 
   dumpDetector.on('priceTick', ({ mint, price, ts, poolAddress }) => {
     priceTracker.update(mint, price, ts, poolAddress);
@@ -394,7 +380,6 @@ async function main() {
   const shutdown = async (signal) => {
     console.log(`\n[main] ${signal} received, shutting down gracefully...`);
     try {
-      if (shredStreamSource) shredStreamSource.stop();
       await tickStream.stop();
       positionManager.stop();
       alertChecker.stop();

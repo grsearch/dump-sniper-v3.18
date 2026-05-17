@@ -1,7 +1,7 @@
 {
   "name": "dump-sniper",
-  "version": "3.18.0-week2",
-  "description": "Solana Pump.fun dump-rebound sniper. v3.18 Week 2: ShredStream gRPC source + bincode entry decoder. Bundle path ready, awaiting Week 3 DumpDetector integration.",
+  "version": "3.18.0-week3",
+  "description": "Solana Pump.fun dump-rebound sniper. v3.18 Week 3: SsSwapDetector — SS path direct dump detection, atomic Jito Bundle same-slot landing.",
   "main": "src/index.js",
   "scripts": {
     "start": "node src/index.js",
